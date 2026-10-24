@@ -1,0 +1,159 @@
+name: Causentry Defended Gemini Review
+
+on:
+  pull_request_target:
+    types: [opened, synchronize, reopened]
+
+concurrency:
+  group: causentry-gemini-review-${{ github.event.pull_request.number }}
+  cancel-in-progress: false
+
+jobs:
+  propose:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+      issues: read
+      pull-requests: read
+    steps:
+      - name: Checkout untrusted review target without credentials
+        # Research-only parity with the pinned official GitInject workflow.
+        # This intentionally checks out an untrusted fork head under
+        # pull_request_target, so the proposal job must remain read-only and
+        # checkout credentials must never be persisted.
+        uses: actions/checkout@8e8c483db84b4bee98b60c0593521ed34d9990e8
+        with:
+          ref: ${{ github.event.pull_request.head.sha }}
+          persist-credentials: false
+
+      - name: Checkout pinned Causentry boundary
+        shell: bash
+        env:
+          CAUSENTRY_COMMIT: ${{ vars.CAUSENTRY_COMMIT }}
+        run: |
+          set -euo pipefail
+          [[ "$CAUSENTRY_COMMIT" =~ ^[0-9a-f]{40}$ ]]
+          git clone --no-checkout --filter=blob:none \
+            https://gitlab.com/gitlab-ai-hackathon/transcend-october-2026/43421581/causentry.git \
+            "$RUNNER_TEMP/causentry"
+          git -C "$RUNNER_TEMP/causentry" checkout --detach "$CAUSENTRY_COMMIT"
+          test "$(git -C "$RUNNER_TEMP/causentry" rev-parse HEAD)" = "$CAUSENTRY_COMMIT"
+
+      - name: Run Gemini with read-only GitHub access and Causentry write-shaped tools
+        uses: google-github-actions/run-gemini-cli@v0
+        id: gemini_pr_review
+        env:
+          GEMINI_CLI_TRUST_WORKSPACE: "true"
+          GITHUB_TOKEN: ${{ github.token }}
+          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+          PYTHONPATH: ${{ runner.temp }}/causentry/src
+          CAUSENTRY_APPROVED_REQUEST_DIR: ${{ runner.temp }}/causentry-approved
+          CAUSENTRY_PULL_NUMBER: ${{ github.event.pull_request.number }}
+          CAUSENTRY_PROJECT_BINDING_ID: ${{ github.repository_id }}
+          CAUSENTRY_REVIEW_FACT_PROFILE: ${{ vars.CAUSENTRY_REVIEW_FACT_PROFILE }}
+        with:
+          gemini_api_key: ${{ secrets.GEMINI_API_KEY }}
+          gemini_cli_version: "0.38.0"
+          gemini_model: "gemini-3.1-pro-preview"
+          upload_artifacts: "true"
+          workflow_name: gemini-review
+          github_pr_number: ${{ github.event.pull_request.number }}
+          settings: |-
+            {
+              "model": {"maxSessionTurns": 25},
+              "telemetry": {
+                "enabled": true,
+                "target": "local",
+                "outfile": ".gemini/telemetry.log"
+              },
+              "mcpServers": {
+                "github-read": {
+                  "command": "docker",
+                  "args": [
+                    "run", "-i", "--rm",
+                    "-e", "GITHUB_PERSONAL_ACCESS_TOKEN",
+                    "ghcr.io/github/github-mcp-server:v0.27.0"
+                  ],
+                  "includeTools": ["pull_request_read"],
+                  "env": {"GITHUB_PERSONAL_ACCESS_TOKEN": "${GITHUB_TOKEN}"}
+                },
+                "causentry-review": {
+                  "command": "python",
+                  "args": ["-m", "secureci.github_review_mcp_entrypoint"],
+                  "includeTools": [
+                    "add_comment_to_pending_review",
+                    "pull_request_review_write"
+                  ],
+                  "env": {
+                    "PYTHONPATH": "${PYTHONPATH}",
+                    "GITHUB_READ_TOKEN": "${GITHUB_TOKEN}",
+                    "GITHUB_REPOSITORY": "${GITHUB_REPOSITORY}",
+                    "CAUSENTRY_PULL_NUMBER": "${CAUSENTRY_PULL_NUMBER}",
+                    "CAUSENTRY_PROJECT_BINDING_ID": "${CAUSENTRY_PROJECT_BINDING_ID}",
+                    "CAUSENTRY_REVIEW_FACT_PROFILE": "${CAUSENTRY_REVIEW_FACT_PROFILE}",
+                    "CAUSENTRY_APPROVED_REQUEST_DIR": "${CAUSENTRY_APPROVED_REQUEST_DIR}"
+                  }
+                }
+              }
+            }
+          extensions: |
+            ["https://github.com/gemini-cli-extensions/code-review"]
+          prompt: /gemini-review
+
+      - name: Upload only content-addressed approved requests
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: causentry-approved-review-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/causentry-approved/*.json
+          if-no-files-found: ignore
+          retention-days: 1
+
+  publish:
+    needs: propose
+    if: ${{ needs.propose.result == 'success' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      contents: read
+      pull-requests: write
+    steps:
+      - name: Checkout pinned Causentry writer only
+        shell: bash
+        env:
+          CAUSENTRY_COMMIT: ${{ vars.CAUSENTRY_COMMIT }}
+        run: |
+          set -euo pipefail
+          [[ "$CAUSENTRY_COMMIT" =~ ^[0-9a-f]{40}$ ]]
+          git clone --no-checkout --filter=blob:none \
+            https://gitlab.com/gitlab-ai-hackathon/transcend-october-2026/43421581/causentry.git \
+            "$RUNNER_TEMP/causentry"
+          git -C "$RUNNER_TEMP/causentry" checkout --detach "$CAUSENTRY_COMMIT"
+          test "$(git -C "$RUNNER_TEMP/causentry" rev-parse HEAD)" = "$CAUSENTRY_COMMIT"
+
+      - name: Download approved request
+        uses: actions/download-artifact@v4
+        with:
+          name: causentry-approved-review-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/approved
+
+      - name: Revalidate and publish at most one complete review
+        shell: bash
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+          PYTHONPATH: ${{ runner.temp }}/causentry/src
+        run: |
+          set -euo pipefail
+          mapfile -t requests < <(find "$RUNNER_TEMP/approved" -maxdepth 1 -type f -name 'approved-*.json' -print)
+          mapfile -t decisions < <(find "$RUNNER_TEMP/approved" -maxdepth 1 -type f -name 'decision-*.json' -print)
+          test "${#decisions[@]}" -ge 1
+          test "${#requests[@]}" -le 1
+          if test "${#requests[@]}" -eq 0; then
+            echo "Causentry recorded a final non-ALLOW decision; no GitHub write is attempted."
+            exit 0
+          fi
+          python -m secureci.github_review_writer_entrypoint \
+            --approved-request "${requests[0]}" \
+            --ledger-dir "$RUNNER_TEMP/causentry-ledger" \
+            --project-binding-id "${{ github.repository_id }}"
